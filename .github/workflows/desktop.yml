@@ -1,0 +1,157 @@
+# Desktop builds: Windows zip, macOS zip, Linux AppImage.
+# On SemVer tags: after all builds succeed → GitHub Release with binaries.
+
+name: Desktop builds
+
+on:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+*'
+  workflow_dispatch:
+
+env:
+  FLUTTER_VERSION: '3.47.4'
+  APP_BINARY: yandex_tracker_worklog
+
+jobs:
+  windows:
+    name: Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - run: flutter config --enable-windows-desktop
+      - run: flutter pub get
+      - run: flutter build windows --release
+      - name: Zip Release folder
+        shell: pwsh
+        run: |
+          $ver = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { $env:GITHUB_SHA.Substring(0,7) }
+          $out = "yandex-tracker-worklog-$ver-windows-x64.zip"
+          Compress-Archive -Path "build\windows\x64\runner\Release\*" -DestinationPath $out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: yandex-tracker-worklog-*-windows-x64.zip
+          if-no-files-found: error
+
+  macos:
+    name: macOS
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - run: flutter config --enable-macos-desktop
+      - run: flutter pub get
+      - run: flutter build macos --release
+      - name: Zip .app
+        run: |
+          VER="${GITHUB_REF_NAME}"
+          if [ "$GITHUB_REF_TYPE" != "tag" ]; then VER="${GITHUB_SHA::7}"; fi
+          OUT="yandex-tracker-worklog-${VER}-macos.zip"
+          ditto -c -k --keepParent \
+            "build/macos/Build/Products/Release/${APP_BINARY}.app" \
+            "$OUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: yandex-tracker-worklog-*-macos.zip
+          if-no-files-found: error
+
+  linux-appimage:
+    name: Linux AppImage
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            clang cmake ninja-build pkg-config \
+            libgtk-3-dev liblzma-dev libsecret-1-dev libfuse2
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - run: flutter config --enable-linux-desktop
+      - run: flutter pub get
+      - run: flutter build linux --release
+      - name: Pack AppImage
+        run: |
+          set -euo pipefail
+          VER="${GITHUB_REF_NAME}"
+          if [ "${GITHUB_REF_TYPE}" != "tag" ]; then VER="${GITHUB_SHA::7}"; fi
+          OUT="yandex-tracker-worklog-${VER}-linux-x64.AppImage"
+          BUNDLE="build/linux/x64/release/bundle"
+          APPDIR="AppDir"
+
+          rm -rf "$APPDIR"
+          mkdir -p "$APPDIR"
+          cp -a "$BUNDLE"/. "$APPDIR/"
+
+          printf '%s\n' \
+            '[Desktop Entry]' \
+            'Type=Application' \
+            'Name=Yandex Tracker Worklog' \
+            'Comment=Desktop worklog client for Yandex Tracker' \
+            "Exec=${APP_BINARY}" \
+            "Icon=${APP_BINARY}" \
+            'Categories=Office;Utility;' \
+            'Terminal=false' \
+            > "$APPDIR/${APP_BINARY}.desktop"
+
+          if [ -f assets/branding/app_icon.png ]; then
+            cp assets/branding/app_icon.png "$APPDIR/${APP_BINARY}.png"
+          fi
+
+          printf '%s\n' \
+            '#!/bin/sh' \
+            'HERE="$(dirname "$(readlink -f "$0")")"' \
+            'export LD_LIBRARY_PATH="${HERE}/lib:${LD_LIBRARY_PATH:-}"' \
+            'exec "${HERE}/yandex_tracker_worklog" "$@"' \
+            > "$APPDIR/AppRun"
+          chmod +x "$APPDIR/AppRun" "$APPDIR/${APP_BINARY}"
+
+          wget -q -O appimagetool \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+          # Avoid FUSE on hosted runners
+          ./appimagetool --appimage-extract
+          ARCH=x86_64 ./squashfs-root/AppRun "$APPDIR" "$OUT"
+          ls -la "$OUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-appimage
+          path: yandex-tracker-worklog-*-linux-x64.AppImage
+          if-no-files-found: error
+
+  publish-release:
+    name: GitHub Release
+    runs-on: ubuntu-latest
+    needs: [windows, macos, linux-appimage]
+    if: github.ref_type == 'tag'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: List files
+        run: ls -la dist/
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          # 0.1.0-rc.1 → prerelease; 0.1.0 → full release
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true
